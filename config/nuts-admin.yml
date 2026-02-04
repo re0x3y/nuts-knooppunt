@@ -1,3 +1,0 @@
-credentialprofiles:
-  - type: HealthcareProviderRoleTypeCredential
-    issuer: http://vektis-issuer:3000

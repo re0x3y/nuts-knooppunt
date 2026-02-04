@@ -14,7 +14,6 @@ func TestLoadConfig_Default(t *testing.T) {
 	require.NoError(t, err)
 
 	// Should have default values
-	assert.False(t, config.Nuts.Enabled)
 	assert.Equal(t, "", config.MCSDAdmin.FHIRBaseURL)
 
 	// MCSD should have default DirectoryResourceTypes
@@ -39,9 +38,6 @@ mcsd:
 
 mcsdadmin:
   fhirbaseurl: "http://localhost:9090/fhir"
-
-nuts:
-  enabled: true
 `
 
 	configFile := filepath.Join(configDir, "knooppunt.yml")
@@ -60,7 +56,6 @@ nuts:
 	require.NoError(t, err)
 
 	// Check loaded values
-	assert.True(t, config.Nuts.Enabled)
 	assert.Equal(t, "http://localhost:9090/fhir", config.MCSDAdmin.FHIRBaseURL)
 	assert.Equal(t, "http://localhost:9090/fhir", config.MCSD.QueryDirectory.FHIRBaseURL)
 
@@ -72,14 +67,12 @@ nuts:
 func TestLoadConfig_FromEnvironmentVariables(t *testing.T) {
 	// Set environment variables
 
-	t.Setenv("KNPT_NUTS_ENABLED", "false")
 	t.Setenv("KNPT_MCSDADMIN_FHIRBASEURL", "http://env-test:8080/fhir")
 
 	config, err := LoadConfig()
 	require.NoError(t, err)
 
 	// Environment variables should override defaults
-	assert.False(t, config.Nuts.Enabled)
 	assert.Equal(t, "http://env-test:8080/fhir", config.MCSDAdmin.FHIRBaseURL)
 }
 
@@ -91,8 +84,6 @@ func TestLoadConfig_EnvOverridesYAML(t *testing.T) {
 	require.NoError(t, err)
 
 	yamlContent := `
-nuts:
-  enabled: true
 mcsdadmin:
   fhirbaseurl: "http://yaml:8080/fhir"
 `
@@ -110,13 +101,11 @@ mcsdadmin:
 	require.NoError(t, err)
 
 	// Set environment variables to override YAML
-	t.Setenv("KNPT_NUTS_ENABLED", "false")
 	t.Setenv("KNPT_MCSDADMIN_FHIRBASEURL", "http://env:8080/fhir")
 
 	config, err := LoadConfig()
 	require.NoError(t, err)
 
 	// Environment should override YAML
-	assert.False(t, config.Nuts.Enabled)                                  // env override
 	assert.Equal(t, "http://env:8080/fhir", config.MCSDAdmin.FHIRBaseURL) // env override
 }

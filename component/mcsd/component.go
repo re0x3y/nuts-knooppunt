@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/nuts-foundation/nuts-knooppunt/component/tracing"
 	"github.com/nuts-foundation/nuts-knooppunt/lib/coding"
 	libfhir "github.com/nuts-foundation/nuts-knooppunt/lib/fhirutil"
+	"github.com/nuts-foundation/nuts-knooppunt/lib/httpauth"
 	"github.com/nuts-foundation/nuts-knooppunt/lib/logging"
 	"github.com/zorgbijjou/golang-fhir-models/fhir-models/caramel/to"
 	"github.com/zorgbijjou/golang-fhir-models/fhir-models/fhir"
@@ -41,6 +43,17 @@ const maxUpdateEntries = 1000
 // searchPageSize is an arbitrary FHIR search result limit (per page), so we have deterministic behavior across FHIR servers,
 // and don't rely on server defaults (which may be very high or very low (Azure FHIR's default is 10)).
 const searchPageSize = 100
+
+// is410GoneError checks if an error indicates a 410 Gone response (history too old).
+// This is used to detect when the _history endpoint can't serve the requested _since time
+// and we need to fallback to Snapshot Mode.
+func is410GoneError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "410") || strings.Contains(strings.ToLower(errStr), "gone")
+}
 
 // makeDirectoryKey creates a composite key from fhirBaseURL and authoritativeUra for tracking sync state per directory.
 // This allows multiple directories with the same FHIR base URL but different authoritative URAs to maintain separate sync states.
@@ -84,6 +97,9 @@ type Config struct {
 	QueryDirectory            DirectoryConfig            `koanf:"query"`
 	ExcludeAdminDirectories   []string                   `koanf:"adminexclude"`
 	DirectoryResourceTypes    []string                   `koanf:"directoryresourcetypes"`
+	Auth                      httpauth.OAuth2Config      `koanf:"auth"`
+	StateFile                 string                     `koanf:"statefile"` // Optional: path to persist sync state across restarts
+	SnapshotModeSupport       bool                       `koanf:"snapshotmodesupport"` // If true, snapshot mode is supported for initial and HTTP 410 syncs
 }
 
 type DirectoryConfig struct {
@@ -109,23 +125,44 @@ type DirectoryUpdateReport struct {
 }
 
 func New(config Config) (*Component, error) {
+	// Create HTTP client with optional OAuth2 authentication
+	var httpClient *http.Client
+	var err error
+	if config.Auth.IsConfigured() {
+		slog.Info("mCSD: OAuth2 authentication configured", slog.String("token_url", config.Auth.TokenURL))
+		httpClient, err = httpauth.NewOAuth2HTTPClient(config.Auth, tracing.WrapTransport(nil))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create OAuth2 HTTP client for mCSD: %w", err)
+		}
+	} else {
+		slog.Info("mCSD: No authentication configured")
+		httpClient = tracing.NewHTTPClient()
+	}
+
 	result := &Component{
 		config: config,
 		fhirClientFn: func(baseURL *url.URL) fhirclient.Client {
-			return fhirclient.New(baseURL, tracing.NewHTTPClient(), &fhirclient.Config{
+			return fhirclient.New(baseURL, httpClient, &fhirclient.Config{
 				UsePostSearch: false,
 			})
 		},
 		directoryResourceTypes: config.DirectoryResourceTypes,
-		lastUpdateTimes:        make(map[string]string),
 		updateMux:              &sync.RWMutex{},
 	}
+
+	// Load persisted sync state if configured
+	if config.StateFile != "" {
+		result.loadSyncState()
+	} else {
+		result.lastUpdateTimes = make(map[string]string)
+	}
+
 	for _, rootDirectory := range config.AdministrationDirectories {
 		if err := result.registerAdministrationDirectory(context.Background(), rootDirectory.FHIRBaseURL, rootDirectoryResourceTypes, true, "", ""); err != nil {
 			return nil, fmt.Errorf("register root administration directory (url=%s): %w", rootDirectory.FHIRBaseURL, err)
 		}
 	}
-	if result.config.DirectoryResourceTypes == nil || len(result.config.DirectoryResourceTypes) == 0 {
+	if len(result.config.DirectoryResourceTypes) == 0 {
 		result.config.DirectoryResourceTypes = append([]string(nil), defaultDirectoryResourceTypes...)
 	}
 	return result, nil
@@ -333,28 +370,85 @@ func (c *Component) updateFromDirectory(ctx context.Context, fhirBaseURLRaw stri
 	searchParams := url.Values{
 		"_count": []string{strconv.Itoa(searchPageSize)},
 	}
-	if hasLastUpdate {
-		searchParams.Set("_since", lastUpdate)
-		slog.DebugContext(ctx, "Using _since parameter for incremental sync from FHIR server", logging.FHIRServer(fhirBaseURLRaw), slog.String("_since", lastUpdate))
-	} else {
-		slog.InfoContext(ctx, "No last update time, doing full sync from FHIR server", logging.FHIRServer(fhirBaseURLRaw))
-	}
 
 	var entries []fhir.BundleEntry
 	var firstSearchSet fhir.Bundle
-	for i, resourceType := range allowedResourceTypes {
-		currEntries, currSearchSet, err := c.queryHistory(ctx, remoteAdminDirectoryFHIRClient, resourceType, searchParams)
-		if err != nil {
-			return DirectoryUpdateReport{}, fmt.Errorf("failed to query %s history: %w", resourceType, err)
-		}
-		entries = append(entries, currEntries...)
-		if i == 0 {
-			firstSearchSet = currSearchSet
+	var useSnapshotMode, useHistoryMode bool
+
+	if hasLastUpdate {
+		useHistoryMode = true
+		// Delta Mode: Use _history with _since for incremental sync
+		searchParams.Set("_since", lastUpdate)
+		slog.DebugContext(ctx, "Delta Mode: Using _history with _since parameter", logging.FHIRServer(fhirBaseURLRaw), slog.String("_since", lastUpdate))
+	} else {
+		// If no last update time, we would normally use Snapshot Mode,
+		// but if it's not enabled, we have to use History Mode without _since to get all resources.
+		useHistoryMode = !c.config.SnapshotModeSupport
+		// Snapshot Mode: Use regular search (GET /Resource) for full sync
+		useSnapshotMode = c.config.SnapshotModeSupport
+	}
+
+	if useHistoryMode {
+		for i, resourceType := range allowedResourceTypes {
+			currEntries, currSearchSet, err := c.queryHistory(ctx, remoteAdminDirectoryFHIRClient, resourceType, searchParams)
+			if err != nil {
+				// Check for 410 Gone - history too old, fallback to Snapshot Mode
+				if is410GoneError(err) {
+					if !c.config.SnapshotModeSupport {
+						return DirectoryUpdateReport{}, fmt.Errorf("410 Gone: history too old for %s and Snapshot Mode is disabled, cannot sync", resourceType)
+					}
+					slog.WarnContext(ctx, "410 Gone: History too old, falling back to Snapshot Mode", logging.FHIRServer(fhirBaseURLRaw), slog.String("resourceType", resourceType))
+					useSnapshotMode = true
+					// Clear the _since parameter and entries for snapshot mode
+					searchParams.Del("_since")
+					entries = nil
+					break
+				}
+				return DirectoryUpdateReport{}, fmt.Errorf("failed to query %s history: %w", resourceType, err)
+			}
+			entries = append(entries, currEntries...)
+			if i == 0 {
+				firstSearchSet = currSearchSet
+			}
 		}
 	}
 
-	// Deduplicate resources from _history query - keep only the most recent version
-	// _history can return multiple versions of the same resource, but transaction bundles must have unique resources
+	// Snapshot Mode: Use regular search (GET /Resource) for full sync
+	if useSnapshotMode {
+		slog.InfoContext(ctx, "Snapshot Mode: Performing full sync using search", logging.FHIRServer(fhirBaseURLRaw))
+		entries = nil // Clear any partial entries from failed delta mode
+
+		for i, resourceType := range allowedResourceTypes {
+			currEntries, currSearchSet, err := c.query(ctx, remoteAdminDirectoryFHIRClient, resourceType, searchParams)
+			if err != nil {
+				return DirectoryUpdateReport{}, fmt.Errorf("failed to query %s: %w", resourceType, err)
+			}
+			// For snapshot mode, we need to add request info for buildUpdateTransaction
+			for j := range currEntries {
+				if currEntries[j].Request == nil {
+					// Search results don't have request info, add it for processing
+					var resourceID string
+					if info, err := libfhir.ExtractResourceInfo(currEntries[j].Resource); err == nil {
+						resourceID = info.ID
+					}
+					currEntries[j].Request = &fhir.BundleEntryRequest{
+						Method: fhir.HTTPVerbPUT,
+						Url:    resourceType + "/" + resourceID,
+					}
+				}
+			}
+			entries = append(entries, currEntries...)
+			if i == 0 {
+				firstSearchSet = currSearchSet
+			}
+		}
+
+		// Clear the last update time since we did a full sync
+		// This ensures the next sync will properly use the new timestamp
+		delete(c.lastUpdateTimes, directoryKey)
+	}
+
+	// Deduplicate resources - for _history this removes old versions, for search this handles any duplicates
 	deduplicatedEntries := deduplicateHistoryEntries(entries)
 
 	// Filter to only include HealthcareService resources
@@ -419,6 +513,12 @@ func (c *Component) updateFromDirectory(ctx context.Context, fhirBaseURLRaw stri
 		return report, nil
 	}
 
+	// if jsonBytes, err := json.MarshalIndent(tx.Entry, "", "  "); err == nil {
+	// 	fmt.Println(string(jsonBytes))
+	// } else {
+	// 	fmt.Printf("Failed to marshal tx.Entry: %v\n", err)
+	// }
+
 	var txResult fhir.Bundle
 	if err := queryDirectoryFHIRClient.CreateWithContext(ctx, tx, &txResult, fhirclient.AtPath("/")); err != nil {
 		return DirectoryUpdateReport{}, fmt.Errorf("failed to apply mCSD update to query directory: %w", err)
@@ -457,7 +557,63 @@ func (c *Component) updateFromDirectory(ctx context.Context, fhirBaseURLRaw stri
 	}
 	c.lastUpdateTimes[directoryKey] = nextSyncTime
 
+	// Persist sync state if configured
+	c.saveSyncState()
+
 	return report, nil
+}
+
+// loadSyncState loads the sync state from the configured state file.
+// If the file doesn't exist or can't be read, it starts with an empty state (full sync).
+func (c *Component) loadSyncState() {
+	if c.config.StateFile == "" {
+		return
+	}
+
+	if c.lastUpdateTimes != nil {
+		slog.Debug("Sync state already initialized, skipping load", slog.String("file", c.config.StateFile))
+		return
+	}
+
+	data, err := os.ReadFile(c.config.StateFile)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			slog.Warn("Failed to read sync state file, starting with full sync", slog.String("file", c.config.StateFile), logging.Error(err))
+		} else {
+			slog.Info("No sync state file found, starting with full sync", slog.String("file", c.config.StateFile))
+		}
+		c.lastUpdateTimes = make(map[string]string)
+		return
+	}
+
+	if err := json.Unmarshal(data, &c.lastUpdateTimes); err != nil {
+		slog.Warn("Failed to parse sync state file, starting with full sync", slog.String("file", c.config.StateFile), logging.Error(err))
+		c.lastUpdateTimes = make(map[string]string)
+		return
+	}
+
+	slog.Info("Loaded sync state from file", slog.String("file", c.config.StateFile), slog.Int("directories", len(c.lastUpdateTimes)))
+}
+
+// saveSyncState persists the sync state to the configured state file.
+// Errors are logged but don't fail the sync operation.
+func (c *Component) saveSyncState() {
+	if c.config.StateFile == "" {
+		return
+	}
+
+	data, err := json.MarshalIndent(c.lastUpdateTimes, "", "  ")
+	if err != nil {
+		slog.Error("Failed to marshal sync state", logging.Error(err))
+		return
+	}
+
+	if err := os.WriteFile(c.config.StateFile, data, 0644); err != nil {
+		slog.Error("Failed to write sync state file", slog.String("file", c.config.StateFile), logging.Error(err))
+		return
+	}
+
+	slog.Debug("Saved sync state to file", slog.String("file", c.config.StateFile))
 }
 
 // queryFHIR performs a FHIR search query with pagination and returns all matching entries.

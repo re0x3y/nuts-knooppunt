@@ -101,6 +101,9 @@ func fmtCoding(cd fhir.Coding) string {
 }
 
 func fmtPeriod(period fhir.Period) string {
+	if period.Start == nil || period.End == nil {
+		return unknownStr
+	}
 	return *period.Start + " - " + *period.End
 }
 

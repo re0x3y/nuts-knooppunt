@@ -17,6 +17,25 @@ import (
 	"github.com/zorgbijjou/golang-fhir-models/fhir-models/fhir"
 )
 
+// hasURAIdentifier checks if a resource (as map) has a URA identifier.
+// This is used to determine if LRZa is authoritative for the Organization's name.
+func hasURAIdentifier(resource map[string]any) bool {
+	identifiers, ok := resource["identifier"].([]any)
+	if !ok {
+		return false
+	}
+	for _, id := range identifiers {
+		idMap, ok := id.(map[string]any)
+		if !ok {
+			continue
+		}
+		if system, ok := idMap["system"].(string); ok && system == coding.URANamingSystem {
+			return true
+		}
+	}
+	return false
+}
+
 // buildUpdateTransaction constructs a FHIR Bundle transaction for updating resources.
 // It filters entries based on allowed resource types and sets the source in the resource meta.
 // The function takes a context, a Bundle to populate, a Bundle entry,
@@ -86,6 +105,16 @@ func buildUpdateTransaction(ctx context.Context, tx *fhir.Bundle, entry fhir.Bun
 
 	if err := ValidateUpdate(ctx, validationRules, entry.Resource, parentOrganizationMap, allHealthcareServices); err != nil {
 		return "", err
+	}
+
+	// LRZa Name Authority (Rule 1): When a healthcare provider's Administration Directory
+	// provides a 'name' value for an Organization with a URA identifier, ignore it.
+	// LRZa is the authoritative source for Organization names when URA is present.
+	// isDiscoverableDirectory=true means LRZa (root), false means provider directory.
+	if resourceType == "Organization" && !isDiscoverableDirectory && hasURAIdentifier(resource) {
+		delete(resource, "name")
+		slog.DebugContext(ctx, "Stripped 'name' from Organization with URA identifier (LRZa is authoritative for name)",
+			slog.String("full_url", *entry.FullUrl))
 	}
 
 	// Only sync resources from non-discoverable directories to the query directory
