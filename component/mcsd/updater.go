@@ -111,11 +111,11 @@ func buildUpdateTransaction(ctx context.Context, tx *fhir.Bundle, entry fhir.Bun
 	// provides a 'name' value for an Organization with a URA identifier, ignore it.
 	// LRZa is the authoritative source for Organization names when URA is present.
 	// isDiscoverableDirectory=true means LRZa (root), false means provider directory.
-	if resourceType == "Organization" && !isDiscoverableDirectory && hasURAIdentifier(resource) {
-		delete(resource, "name")
-		slog.DebugContext(ctx, "Stripped 'name' from Organization with URA identifier (LRZa is authoritative for name)",
-			slog.String("full_url", *entry.FullUrl))
-	}
+	// if resourceType == "Organization" && !isDiscoverableDirectory && hasURAIdentifier(resource) { // TODO: commented out for PoC.
+	// 	delete(resource, "name")
+	// 	slog.DebugContext(ctx, "Stripped 'name' from Organization with URA identifier (LRZa is authoritative for name)",
+	// 		slog.String("full_url", *entry.FullUrl))
+	// }
 
 	// Only sync resources from non-discoverable directories to the query directory
 	// Exception: mCSD directory endpoints are synced even from discoverable directories for resilience (e.g. if the root directory is down)

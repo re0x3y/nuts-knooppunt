@@ -79,6 +79,7 @@ func makeDirectoryKey(fhirBaseURL, authoritativeUra string) string {
 type Component struct {
 	config       Config
 	fhirClientFn func(baseURL *url.URL) fhirclient.Client
+	fhirQueryClient fhirclient.Client
 
 	administrationDirectories []administrationDirectory
 	directoryResourceTypes    []string
@@ -139,6 +140,11 @@ func New(config Config) (*Component, error) {
 		httpClient = tracing.NewHTTPClient()
 	}
 
+	queryDirectoryFHIRBaseURL, err := url.Parse(config.QueryDirectory.FHIRBaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Query Directory FHIR base URL (url=%s): %w", config.QueryDirectory.FHIRBaseURL, err)
+	}
+
 	result := &Component{
 		config: config,
 		fhirClientFn: func(baseURL *url.URL) fhirclient.Client {
@@ -146,6 +152,9 @@ func New(config Config) (*Component, error) {
 				UsePostSearch: false,
 			})
 		},
+		fhirQueryClient: fhirclient.New(queryDirectoryFHIRBaseURL, tracing.NewHTTPClient(), &fhirclient.Config{
+			UsePostSearch: false,
+		}),
 		directoryResourceTypes: config.DirectoryResourceTypes,
 		updateMux:              &sync.RWMutex{},
 	}
