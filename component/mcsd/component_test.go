@@ -72,6 +72,7 @@ func TestComponent_update_regression(t *testing.T) {
 	}
 	component, err := New(config)
 	require.NoError(t, err)
+	component.fhirQueryClient = localClient
 	component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 		if baseURL.String() == server.URL {
 			return fhirclient.New(baseURL, http.DefaultClient, nil)
@@ -177,6 +178,7 @@ func TestComponent_update(t *testing.T) {
 	component, err := New(config)
 	require.NoError(t, err)
 
+	component.fhirQueryClient = localClient
 	unknownFHIRServerClient := &test.StubFHIRClient{
 		Error: errors.New("404 Not Found"),
 	}
@@ -318,6 +320,7 @@ func TestComponent_incrementalUpdates(t *testing.T) {
 	component, err := New(config)
 	require.NoError(t, err)
 
+	component.fhirQueryClient = localClient
 	component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 		if baseURL.String() == rootDirServer.URL {
 			return fhirclient.New(baseURL, http.DefaultClient, &fhirclient.Config{
@@ -516,6 +519,7 @@ func TestComponent_multipleDirsSameFHIRBaseURL(t *testing.T) {
 	component, err := New(config)
 	require.NoError(t, err)
 
+	component.fhirQueryClient = localClient
 	component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 		urlStr := baseURL.String()
 		if urlStr == rootDirServer.URL || urlStr == sharedDirServer.URL {
@@ -825,6 +829,7 @@ func TestComponent_updateFromDirectory(t *testing.T) {
 		component, err := New(config)
 		require.NoError(t, err)
 
+		component.fhirQueryClient = capturingClient
 		component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 			if baseURL.String() == server.URL+"/fhir" {
 				return fhirclient.New(baseURL, http.DefaultClient, &fhirclient.Config{UsePostSearch: false})
@@ -982,6 +987,7 @@ func TestComponent_updateFromDirectory(t *testing.T) {
 
 		// Mock FHIR client that tracks operations
 		capturingClient := &test.StubFHIRClient{}
+		component.fhirQueryClient = capturingClient
 		component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 			if baseURL.String() == server.URL+"/fhir" {
 				return fhirclient.New(baseURL, http.DefaultClient, &fhirclient.Config{UsePostSearch: false})
@@ -1088,6 +1094,7 @@ func TestComponent_updateFromDirectory(t *testing.T) {
 		require.NoError(t, err)
 
 		capturingClient := &test.StubFHIRClient{}
+		component.fhirQueryClient = capturingClient
 		component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 			if baseURL.String() == server.URL+"/fhir" {
 				return fhirclient.New(baseURL, http.DefaultClient, &fhirclient.Config{UsePostSearch: false})
@@ -1256,6 +1263,7 @@ func TestComponent_updateFromDirectory(t *testing.T) {
 		assert.Equal(t, customResourceTypes, component.directoryResourceTypes)
 
 		capturingClient := &test.StubFHIRClient{}
+		component.fhirQueryClient = capturingClient
 		component.fhirClientFn = func(baseURL *url.URL) fhirclient.Client {
 			if strings.HasPrefix(baseURL.String(), server.URL) {
 				return fhirclient.New(baseURL, http.DefaultClient, &fhirclient.Config{UsePostSearch: false})

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -77,8 +78,8 @@ func makeDirectoryKey(fhirBaseURL, authoritativeUra string) string {
 //   - These are mitigating measures to prevent an attacker to spoof another care organization.
 //   - The organization's mcsd-directory-endpoint must be discoverable through the root mCSD Directory.'
 type Component struct {
-	config       Config
-	fhirClientFn func(baseURL *url.URL) fhirclient.Client
+	config          Config
+	fhirClientFn    func(baseURL *url.URL) fhirclient.Client
 	fhirQueryClient fhirclient.Client
 
 	administrationDirectories []administrationDirectory
@@ -99,7 +100,7 @@ type Config struct {
 	ExcludeAdminDirectories   []string                   `koanf:"adminexclude"`
 	DirectoryResourceTypes    []string                   `koanf:"directoryresourcetypes"`
 	Auth                      httpauth.OAuth2Config      `koanf:"auth"`
-	StateFile                 string                     `koanf:"statefile"` // Optional: path to persist sync state across restarts
+	StateFile                 string                     `koanf:"statefile"`           // Optional: path to persist sync state across restarts
 	SnapshotModeSupport       bool                       `koanf:"snapshotmodesupport"` // If true, snapshot mode is supported for initial and HTTP 410 syncs
 }
 
@@ -148,11 +149,11 @@ func New(config Config) (*Component, error) {
 	result := &Component{
 		config: config,
 		fhirClientFn: func(baseURL *url.URL) fhirclient.Client {
-			return fhirclient.New(baseURL, httpClient, &fhirclient.Config{
+			return fhirclient.New(baseURL, tracing.NewHTTPClient(), &fhirclient.Config{
 				UsePostSearch: false,
 			})
 		},
-		fhirQueryClient: fhirclient.New(queryDirectoryFHIRBaseURL, tracing.NewHTTPClient(), &fhirclient.Config{
+		fhirQueryClient: fhirclient.New(queryDirectoryFHIRBaseURL, httpClient, &fhirclient.Config{
 			UsePostSearch: false,
 		}),
 		directoryResourceTypes: config.DirectoryResourceTypes,
@@ -363,11 +364,7 @@ func (c *Component) updateFromDirectory(ctx context.Context, fhirBaseURLRaw stri
 	}
 	remoteAdminDirectoryFHIRClient := c.fhirClientFn(remoteAdminDirectoryFHIRBaseURL)
 
-	queryDirectoryFHIRBaseURL, err := url.Parse(c.config.QueryDirectory.FHIRBaseURL)
-	if err != nil {
-		return DirectoryUpdateReport{}, err
-	}
-	queryDirectoryFHIRClient := c.fhirClientFn(queryDirectoryFHIRBaseURL)
+	queryDirectoryFHIRClient := c.fhirQueryClient
 
 	// Get last update time for incremental sync
 	directoryKey := makeDirectoryKey(fhirBaseURLRaw, authoritativeUra)
@@ -601,6 +598,13 @@ func (c *Component) loadSyncState() {
 		return
 	}
 
+	for key := range c.lastUpdateTimes { // TODO: once all data in stored successfully, remove this.
+		// delete entry if LRZa is present, this is ensure that always query the full history.
+		if key == "https://knooppunt-test.nuts-services.nl/lrza/mcsd" {
+			delete(c.lastUpdateTimes, key)
+		}
+	}
+
 	slog.Info("Loaded sync state from file", slog.String("file", c.config.StateFile), slog.Int("directories", len(c.lastUpdateTimes)))
 }
 
@@ -614,6 +618,12 @@ func (c *Component) saveSyncState() {
 	data, err := json.MarshalIndent(c.lastUpdateTimes, "", "  ")
 	if err != nil {
 		slog.Error("Failed to marshal sync state", logging.Error(err))
+		return
+	}
+
+	dir := filepath.Dir(c.config.StateFile)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		slog.Error("Failed to create directory for sync state file", slog.String("dir", dir), logging.Error(err))
 		return
 	}
 
